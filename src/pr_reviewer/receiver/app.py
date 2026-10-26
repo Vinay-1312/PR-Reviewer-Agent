@@ -44,15 +44,26 @@ def get_publisher() -> Publisher:
     return PubSubPublisher(os.environ["PROJECT_ID"], os.environ["TOPIC"])
 
 
+@lru_cache
 def get_webhook_secret() -> str:
-    return os.environ["GITHUB_WEBHOOK_SECRET"]
+    raw = os.environ["GITHUB_WEBHOOK_SECRET"]
+    secret = raw.strip()
+    if secret != raw:
+        # e.g. a trailing newline added when the secret version was created from a shell pipe
+        log.warning("webhook secret had surrounding whitespace; stripped %d chars", len(raw) - len(secret))
+    return secret
 
 
-def signature_is_valid(secret: str, body: bytes, header: str | None) -> bool:
-    if not header or not header.startswith("sha256="):
-        return False
+def signature_failure(secret: str, body: bytes, header: str | None) -> str | None:
+    """Return why the signature is invalid, or None if it is valid. Never includes secret material."""
+    if not header:
+        return "missing X-Hub-Signature-256 header"
+    if not header.startswith("sha256="):
+        return "X-Hub-Signature-256 header is not in sha256=<hex> format"
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header)
+    if not hmac.compare_digest(expected, header):
+        return f"signature mismatch (body {len(body)} bytes, configured secret {len(secret)} chars)"
+    return None
 
 
 def build_message(payload: dict, delivery_id: str) -> dict | None:
@@ -91,7 +102,9 @@ async def webhook(
     publisher: Publisher = Depends(get_publisher),
 ) -> dict:
     body = await request.body()
-    if not signature_is_valid(secret, body, x_hub_signature_256):
+    failure = signature_failure(secret, body, x_hub_signature_256)
+    if failure:
+        log.warning("rejected delivery %s (event %s): %s", x_github_delivery, x_github_event, failure)
         raise HTTPException(status_code=401, detail="invalid signature")
 
     if x_github_event == "ping":
