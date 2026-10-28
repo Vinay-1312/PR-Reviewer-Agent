@@ -19,6 +19,7 @@ logging.basicConfig(level=logging.INFO)
 
 REVIEWABLE_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
 PUBLISH_TIMEOUT_SECONDS = 10
+DEFAULT_TRUSTED_ASSOCIATIONS = "OWNER,MEMBER,COLLABORATOR"
 
 app = FastAPI(title="PR webhook receiver")
 
@@ -42,6 +43,26 @@ class PubSubPublisher:
 @lru_cache
 def get_publisher() -> Publisher:
     return PubSubPublisher(os.environ["PROJECT_ID"], os.environ["TOPIC"])
+
+
+@lru_cache
+def get_trusted_associations() -> frozenset[str] | None:
+    """Author associations whose PRs get reviewed; None means everyone ("*").
+
+    PR content is untrusted input to the model, so by default only people with a standing relationship
+    to the repo are reviewed. GitHub values: OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR,
+    FIRST_TIMER, NONE, MANNEQUIN.
+    """
+    raw = os.environ.get("TRUSTED_ASSOCIATIONS", DEFAULT_TRUSTED_ASSOCIATIONS).strip()
+    if raw == "*":
+        return None
+    return frozenset(part.strip().upper() for part in raw.split(",") if part.strip())
+
+
+def author_is_trusted(pull_request: dict, trusted: frozenset[str] | None) -> bool:
+    if trusted is None:
+        return True
+    return (pull_request.get("author_association") or "").upper() in trusted
 
 
 @lru_cache
@@ -100,6 +121,7 @@ async def webhook(
     x_github_delivery: str = Header(default=""),
     secret: str = Depends(get_webhook_secret),
     publisher: Publisher = Depends(get_publisher),
+    trusted: frozenset[str] | None = Depends(get_trusted_associations),
 ) -> dict:
     body = await request.body()
     failure = signature_failure(secret, body, x_hub_signature_256)
@@ -120,6 +142,11 @@ async def webhook(
     message = build_message(payload, x_github_delivery)
     if message is None:
         return {"status": "ignored", "reason": "not a reviewable pull request event"}
+
+    if not author_is_trusted(payload["pull_request"], trusted):
+        association = payload["pull_request"].get("author_association")
+        log.info("ignored %s#%s: author association %s is not trusted", message["repo"], message["pr_number"], association)
+        return {"status": "ignored", "reason": "author is not trusted"}
 
     try:
         publisher.publish(

@@ -5,7 +5,13 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from pr_reviewer.receiver.app import app, get_publisher, get_webhook_secret
+from pr_reviewer.receiver.app import (
+    app,
+    author_is_trusted,
+    get_publisher,
+    get_trusted_associations,
+    get_webhook_secret,
+)
 
 SECRET = "test-secret"
 
@@ -43,7 +49,12 @@ def pr_payload(**overrides) -> dict:
         "action": "opened",
         "installation": {"id": 99},
         "repository": {"full_name": "octo/repo"},
-        "pull_request": {"number": 7, "draft": False, "head": {"sha": "abc123"}},
+        "pull_request": {
+            "number": 7,
+            "draft": False,
+            "head": {"sha": "abc123"},
+            "author_association": "MEMBER",
+        },
     }
     payload.update(overrides)
     return payload
@@ -168,3 +179,53 @@ def test_secret_whitespace_is_stripped(monkeypatch):
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "abc123\r\n")
     assert get_webhook_secret() == "abc123"
     get_webhook_secret.cache_clear()
+
+
+@pytest.mark.parametrize("association", ["OWNER", "MEMBER", "COLLABORATOR", "member"])
+def test_trusted_authors_are_queued(client, publisher, association):
+    payload = pr_payload()
+    payload["pull_request"]["author_association"] = association
+    assert post(client, payload).json() == {"status": "queued"}
+    assert len(publisher.published) == 1
+
+
+@pytest.mark.parametrize("association", ["NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", None])
+def test_untrusted_authors_are_ignored(client, publisher, association):
+    payload = pr_payload()
+    payload["pull_request"]["author_association"] = association
+    response = post(client, payload)
+    assert response.status_code == 200
+    assert response.json() == {"status": "ignored", "reason": "author is not trusted"}
+    assert publisher.published == []
+
+
+def test_missing_association_is_untrusted(client, publisher):
+    payload = pr_payload()
+    del payload["pull_request"]["author_association"]
+    assert post(client, payload).json()["reason"] == "author is not trusted"
+    assert publisher.published == []
+
+
+def test_wildcard_trusts_everyone(client, publisher):
+    app.dependency_overrides[get_trusted_associations] = lambda: None
+    payload = pr_payload()
+    payload["pull_request"]["author_association"] = "NONE"
+    assert post(client, payload).json() == {"status": "queued"}
+
+
+def test_trusted_associations_come_from_the_environment(monkeypatch):
+    get_trusted_associations.cache_clear()
+    monkeypatch.setenv("TRUSTED_ASSOCIATIONS", " owner , Contributor ")
+    assert get_trusted_associations() == frozenset({"OWNER", "CONTRIBUTOR"})
+    get_trusted_associations.cache_clear()
+    monkeypatch.setenv("TRUSTED_ASSOCIATIONS", "*")
+    assert get_trusted_associations() is None
+    get_trusted_associations.cache_clear()
+    monkeypatch.delenv("TRUSTED_ASSOCIATIONS")
+    assert get_trusted_associations() == frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+    get_trusted_associations.cache_clear()
+
+
+def test_author_is_trusted_helper():
+    assert author_is_trusted({"author_association": "NONE"}, None)
+    assert not author_is_trusted({}, frozenset({"OWNER"}))

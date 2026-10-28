@@ -47,6 +47,18 @@ variable "github_app_id" {
   default = ""
 }
 
+variable "trusted_author_associations" {
+  type        = string
+  default     = "OWNER,MEMBER,COLLABORATOR"
+  description = "Comma-separated GitHub author_association values whose PRs are reviewed, or * for everyone"
+}
+
+variable "gemini_model" {
+  type        = string
+  default     = "gemini-2.5-flash"
+  description = "Gemini model the worker uses for reviews"
+}
+
 variable "billing_account" {
   type        = string
   default     = ""
@@ -208,6 +220,10 @@ resource "google_cloud_run_v2_service" "receiver" {
         value = google_pubsub_topic.pr_events.name
       }
       env {
+        name  = "TRUSTED_ASSOCIATIONS"
+        value = var.trusted_author_associations
+      }
+      env {
         name = "GITHUB_WEBHOOK_SECRET"
         value_source {
           secret_key_ref {
@@ -260,6 +276,10 @@ resource "google_cloud_run_v2_service" "worker" {
       env {
         name  = "GITHUB_APP_ID"
         value = var.github_app_id
+      }
+      env {
+        name  = "GEMINI_MODEL"
+        value = var.gemini_model
       }
       env {
         name = "GITHUB_APP_PRIVATE_KEY"
@@ -316,7 +336,52 @@ resource "google_pubsub_subscription" "pr_events_push" {
     maximum_backoff = "600s"
   }
 
-  depends_on = [google_cloud_run_v2_service_iam_member.worker_invoker]
+  # After this many failed deliveries Pub/Sub moves the message to the dead-letter topic.
+  # With the 10s-600s backoff, attempt 6 lands ~310s in, just after a crashed worker's 300s lease
+  # expires, so 7 leaves a recovery attempt plus one spare.
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.pr_events_dlq.id
+    max_delivery_attempts = 7
+  }
+
+  depends_on = [
+    google_cloud_run_v2_service_iam_member.worker_invoker,
+    google_pubsub_topic_iam_member.dlq_publisher,
+  ]
+}
+
+# ---------- Dead-letter queue ----------
+# Messages that keep failing land here instead of retrying forever. The pull subscription keeps
+# them for 7 days (a dead-letter topic with no subscription would just drop them).
+resource "google_pubsub_topic" "pr_events_dlq" {
+  name       = "pr-events-dlq"
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_pubsub_subscription" "pr_events_dlq_pull" {
+  name                       = "pr-events-dlq-pull"
+  topic                      = google_pubsub_topic.pr_events_dlq.id
+  ack_deadline_seconds       = 60
+  message_retention_duration = "604800s"
+}
+
+# Pub/Sub's own service agent forwards failed messages, so it needs to publish to the DLQ
+# and to ack from the source subscription.
+locals {
+  pubsub_service_agent = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+}
+
+resource "google_pubsub_topic_iam_member" "dlq_publisher" {
+  topic  = google_pubsub_topic.pr_events_dlq.name
+  role   = "roles/pubsub.publisher"
+  member = local.pubsub_service_agent
+}
+
+resource "google_pubsub_subscription_iam_member" "dlq_source_subscriber" {
+  count        = var.deploy_services ? 1 : 0
+  subscription = google_pubsub_subscription.pr_events_push[0].name
+  role         = "roles/pubsub.subscriber"
+  member       = local.pubsub_service_agent
 }
 
 # ---------- Budget alert (emails billing admins by default) ----------
