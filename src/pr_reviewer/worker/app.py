@@ -25,7 +25,7 @@ from pr_reviewer.worker.pipeline import Services, process
 log = logging.getLogger("worker")
 logging.basicConfig(level=logging.INFO)
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 app = FastAPI(title="PR review worker")
 

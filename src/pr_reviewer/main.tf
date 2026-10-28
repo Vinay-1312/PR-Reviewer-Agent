@@ -55,7 +55,7 @@ variable "trusted_author_associations" {
 
 variable "gemini_model" {
   type        = string
-  default     = "gemini-2.5-flash"
+  default     = "gemini-3.8-flash"
   description = "Gemini model the worker uses for reviews"
 }
 
