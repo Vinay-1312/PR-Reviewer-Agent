@@ -1,0 +1,8 @@
+# Run from the repo root:
+#   gcloud builds submit --config docker/worker/cloudbuild.yaml \
+#     --substitutions _IMAGE=us-central1-docker.pkg.dev/PROJECT/pr-review/worker:v1 .
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "docker/worker/Dockerfile", "-t", "${_IMAGE}", "."]
+images:
+  - ${_IMAGE}
