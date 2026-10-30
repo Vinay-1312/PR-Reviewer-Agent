@@ -15,3 +15,11 @@ wheels/
 *.tfstate.*
 *.tfvars
 crash.log
+
+# Secrets and Terraform local state
+*.pem
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+tfplan
